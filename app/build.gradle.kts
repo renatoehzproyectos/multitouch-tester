@@ -22,6 +22,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Reuses the auto-generated debug keystore so the release APK is signed and
+            // installable for testing. Fine for personal testing; for real distribution,
+            // replace this with a dedicated release signingConfig backed by a real
+            // keystore (see the README section on GitHub Secrets-based signing).
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
