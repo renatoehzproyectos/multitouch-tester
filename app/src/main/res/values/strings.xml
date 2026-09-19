@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Multi-Touch Tester</string>
+    <string name="accessibility_service_description">
+        Lets you place two markers on screen and hold two simultaneous synthetic touch
+        contacts for QA / multi-touch input testing. Does not read screen content from
+        other apps and performs no actions other than the gestures you explicitly start.
+    </string>
+</resources>

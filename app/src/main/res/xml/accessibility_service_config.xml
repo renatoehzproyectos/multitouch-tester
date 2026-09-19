@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  This service intentionally requests the smallest possible capability set:
+  it can PERFORM gestures (dispatchGesture) but does NOT request
+  canRetrieveWindowContent, so it cannot read the contents of other apps.
+  It does not listen to any accessibility event types, since it never
+  inspects the screen - it only injects touch contacts the user positioned.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRequestFilterKeyEvents"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="100" />

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Needed to draw the floating control panel -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Foreground service so the accessibility service can keep running reliably
+         while touches are held (Android 9+ requirement for long-lived services) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@android:drawable/ic_menu_manage"
+        android:label="Multi-Touch Tester"
+        android:theme="@android:style/Theme.Material.Light">
+
+        <!-- Entry point: explains what the tool does and walks the user through
+             granting the Accessibility Service + "draw over other apps" permission -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- The actual multi-touch engine. Must be an AccessibilityService: dispatchGesture()
+             is the only public, documented API that can inject synthetic touch events, and it
+             is only available to a bound, user-enabled AccessibilityService. -->
+        <service
+            android:name=".MultiTouchAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true"
+            android:foregroundServiceType="specialUse"
+            android:label="Multi-Touch Tester Service">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+    </application>
+</manifest>
