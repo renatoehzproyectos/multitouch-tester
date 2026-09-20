@@ -13,6 +13,7 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.os.Build
 import android.util.DisplayMetrics
+import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -43,6 +44,10 @@ import android.widget.TextView
  */
 class MultiTouchAccessibilityService : AccessibilityService() {
 
+    companion object {
+        private const val TAG = "MultiTouchTester"
+    }
+
     enum class TouchState { READY, ACTIVE, RELEASED, ERROR }
 
     private var windowManager: WindowManager? = null
@@ -58,14 +63,18 @@ class MultiTouchAccessibilityService : AccessibilityService() {
 
     // Segment length for each continued chunk of the held stroke. Short enough that a
     // rotation/resize/emergency-stop is honored quickly; long enough to avoid excessive
-    // rescheduling. This is purely an implementation continuity detail, invisible to the
-    // receiving app as a single continuous press.
-    private val segmentDurationMs = 400L
+    // rescheduling. Kept at a few seconds rather than a few hundred ms: very tight
+    // continuation loops (<500ms) have been observed to race with busy launcher/system
+    // UI threads on some OEM builds and get cancelled by the system before the next
+    // continueStroke() lands.
+    private val segmentDurationMs = 3000L
 
     private var strokeId1: GestureDescription.StrokeDescription? = null
     private var strokeId2: GestureDescription.StrokeDescription? = null
     private var sessionActive = false
     private var sessionGeneration = 0 // bumped on stop/release to invalidate stale callbacks
+    private var continuationCount = 0
+    private var sessionStartMs = 0L
 
     private val showPanelReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -325,6 +334,8 @@ class MultiTouchAccessibilityService : AccessibilityService() {
         if (sessionActive) return
         sessionGeneration++
         val myGeneration = sessionGeneration
+        continuationCount = 0
+        sessionStartMs = System.currentTimeMillis()
 
         val path1 = Path().apply { moveTo(point1[0], point1[1]) }
         val path2 = Path().apply { moveTo(point2[0], point2[1]) }
@@ -344,20 +355,33 @@ class MultiTouchAccessibilityService : AccessibilityService() {
         strokeId1 = stroke1
         strokeId2 = stroke2
 
+        Log.d(TAG, "startTest: dispatching initial gesture at " +
+                "(${point1[0]},${point1[1]}) and (${point2[0]},${point2[1]})")
+
         val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
+                val elapsed = System.currentTimeMillis() - sessionStartMs
+                Log.d(TAG, "onCompleted: initial segment ok after ${elapsed}ms")
                 if (myGeneration != sessionGeneration) return // superseded by stop/release
                 continueHolding(myGeneration)
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
+                val elapsed = System.currentTimeMillis() - sessionStartMs
+                Log.w(TAG, "onCancelled: initial segment cancelled after ${elapsed}ms, " +
+                        "$continuationCount prior continuations")
                 if (myGeneration != sessionGeneration) return
                 sessionActive = false
-                setState(TouchState.ERROR, "Gesture was cancelled by the system.")
+                setState(
+                    TouchState.ERROR,
+                    "Gesture was cancelled by the system after ${elapsed}ms " +
+                            "(0 continuations completed)."
+                )
             }
         }, null)
 
         if (!dispatched) {
+            Log.w(TAG, "startTest: dispatchGesture() returned false immediately")
             setState(
                 TouchState.ERROR,
                 "Android rejected the gesture request (accessibility service not " +
@@ -393,13 +417,22 @@ class MultiTouchAccessibilityService : AccessibilityService() {
         val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
                 if (myGeneration != sessionGeneration) return
+                continuationCount++
+                setState(TouchState.ACTIVE, "Two touches active ($continuationCount).")
                 continueHolding(myGeneration)
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
+                val elapsed = System.currentTimeMillis() - sessionStartMs
+                Log.w(TAG, "onCancelled: continuation cancelled after ${elapsed}ms, " +
+                        "$continuationCount prior continuations completed")
                 if (myGeneration != sessionGeneration) return
                 sessionActive = false
-                setState(TouchState.ERROR, "Touch hold was interrupted by the system.")
+                setState(
+                    TouchState.ERROR,
+                    "Touch hold was interrupted by the system after " +
+                            "$continuationCount continuation(s) (${elapsed}ms)."
+                )
             }
         }, null)
 
