@@ -30,11 +30,15 @@ import android.widget.TextView
  * Design notes / why this approach and not something else:
  * - dispatchGesture() is the only public Android API that can inject touch input outside
  *   the app's own window, and it is gated behind an explicitly user-enabled
- *   AccessibilityService. There is no way to hold a gesture "forever" in one call, so a
- *   single stroke is expressed as a short segment with willContinue(true); when the OS
- *   reports it completed, we immediately continue it with continueStroke() at the same
- *   coordinates. Done back-to-back this reads to the receiving app as one uninterrupted
- *   press, not a series of taps - satisfying "never convert into sequential taps".
+ *   AccessibilityService. It cannot hold a gesture literally forever, but a single
+ *   StrokeDescription can be held continuously for the platform's maximum gesture
+ *   duration (GestureDescription.getMaxGestureDuration(), ~60s) in one uninterrupted
+ *   call - satisfying "never convert into sequential taps". If that duration is reached
+ *   while the user still wants it held, the same hold is re-dispatched seamlessly.
+ *   An earlier version used continueStroke()/willContinue(true) to chain short segments
+ *   into an indefinite hold; on this project's test hardware that chain was cancelled by
+ *   the system within milliseconds regardless of segment length, so it was abandoned in
+ *   favor of this single-long-stroke approach, which is the better-supported path.
  * - Two StrokeDescriptions are always dispatched together inside a single
  *   GestureDescription, so both contacts start and continue in lockstep - genuine
  *   multi-touch, not two independent single-touch sequences.
@@ -61,19 +65,11 @@ class MultiTouchAccessibilityService : AccessibilityService() {
     private var state = TouchState.READY
     private var stateText: TextView? = null
 
-    // Segment length for each continued chunk of the held stroke. Short enough that a
-    // rotation/resize/emergency-stop is honored quickly; long enough to avoid excessive
-    // rescheduling. Kept at a few seconds rather than a few hundred ms: very tight
-    // continuation loops (<500ms) have been observed to race with busy launcher/system
-    // UI threads on some OEM builds and get cancelled by the system before the next
-    // continueStroke() lands.
-    private val segmentDurationMs = 3000L
+    // Segment-based continuation (willContinue/continueStroke) was tried and abandoned:
+    // see startTest() for why a single long-duration stroke is used instead.
 
-    private var strokeId1: GestureDescription.StrokeDescription? = null
-    private var strokeId2: GestureDescription.StrokeDescription? = null
     private var sessionActive = false
     private var sessionGeneration = 0 // bumped on stop/release to invalidate stale callbacks
-    private var continuationCount = 0
     private var sessionStartMs = 0L
 
     private val showPanelReceiver = object : BroadcastReceiver() {
@@ -334,48 +330,57 @@ class MultiTouchAccessibilityService : AccessibilityService() {
         if (sessionActive) return
         sessionGeneration++
         val myGeneration = sessionGeneration
-        continuationCount = 0
         sessionStartMs = System.currentTimeMillis()
+
+        // Single non-continuing stroke held for the platform's maximum gesture duration
+        // (~60s on API 26+). This is one continuous press at the API level - never
+        // sequential taps - and deliberately avoids continueStroke()/willContinue(true):
+        // on this device that continuation-chaining technique was observed to get
+        // cancelled by the system within tens of milliseconds regardless of segment
+        // length, while a single uninterrupted long stroke is the well-supported path.
+        val maxDuration = GestureDescription.getMaxGestureDuration()
 
         val path1 = Path().apply { moveTo(point1[0], point1[1]) }
         val path2 = Path().apply { moveTo(point2[0], point2[1]) }
 
-        val stroke1 = GestureDescription.StrokeDescription(
-            path1, 0, segmentDurationMs, /* willContinue = */ true
-        )
-        val stroke2 = GestureDescription.StrokeDescription(
-            path2, 0, segmentDurationMs, /* willContinue = */ true
-        )
+        val stroke1 = GestureDescription.StrokeDescription(path1, 0, maxDuration)
+        val stroke2 = GestureDescription.StrokeDescription(path2, 0, maxDuration)
 
         val gesture = GestureDescription.Builder()
             .addStroke(stroke1)
             .addStroke(stroke2)
             .build()
 
-        strokeId1 = stroke1
-        strokeId2 = stroke2
-
-        Log.d(TAG, "startTest: dispatching initial gesture at " +
+        Log.d(TAG, "startTest: dispatching single ${maxDuration}ms hold at " +
                 "(${point1[0]},${point1[1]}) and (${point2[0]},${point2[1]})")
 
         val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
                 val elapsed = System.currentTimeMillis() - sessionStartMs
-                Log.d(TAG, "onCompleted: initial segment ok after ${elapsed}ms")
-                if (myGeneration != sessionGeneration) return // superseded by stop/release
-                continueHolding(myGeneration)
+                Log.d(TAG, "onCompleted: hold ran its full course after ${elapsed}ms")
+                if (myGeneration != sessionGeneration) return // release/stop already handled it
+                if (!sessionActive) return
+                // Reached the platform's max duration while the user still wants it held -
+                // seamlessly re-dispatch the same hold rather than surfacing an error.
+                startTest()
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
                 val elapsed = System.currentTimeMillis() - sessionStartMs
-                Log.w(TAG, "onCancelled: initial segment cancelled after ${elapsed}ms, " +
-                        "$continuationCount prior continuations")
-                if (myGeneration != sessionGeneration) return
+                // A cancellation with this generation stale means WE caused it on purpose
+                // via releaseTest()/emergencyStop() (see endStrokes) - that's success, not
+                // an error, so ignore it here.
+                if (myGeneration != sessionGeneration) {
+                    Log.d(TAG, "onCancelled: expected, this generation was released ($elapsed" +
+                            "ms in)")
+                    return
+                }
+                Log.w(TAG, "onCancelled: UNEXPECTED cancellation after ${elapsed}ms")
                 sessionActive = false
                 setState(
                     TouchState.ERROR,
-                    "Gesture was cancelled by the system after ${elapsed}ms " +
-                            "(0 continuations completed)."
+                    "Touch hold was interrupted by the system after ${elapsed}ms " +
+                            "(not initiated by Release/Stop)."
                 )
             }
         }, null)
@@ -394,54 +399,6 @@ class MultiTouchAccessibilityService : AccessibilityService() {
         setState(TouchState.ACTIVE, "Two touches active.")
     }
 
-    /** Keeps re-issuing continueStroke() at the same coordinates so the press never lifts. */
-    private fun continueHolding(myGeneration: Int) {
-        if (!sessionActive || myGeneration != sessionGeneration) return
-        val s1 = strokeId1 ?: return
-        val s2 = strokeId2 ?: return
-
-        val path1 = Path().apply { moveTo(point1[0], point1[1]) }
-        val path2 = Path().apply { moveTo(point2[0], point2[1]) }
-
-        val nextStroke1 = s1.continueStroke(path1, 0, segmentDurationMs, true)
-        val nextStroke2 = s2.continueStroke(path2, 0, segmentDurationMs, true)
-
-        val gesture = GestureDescription.Builder()
-            .addStroke(nextStroke1)
-            .addStroke(nextStroke2)
-            .build()
-
-        strokeId1 = nextStroke1
-        strokeId2 = nextStroke2
-
-        val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription?) {
-                if (myGeneration != sessionGeneration) return
-                continuationCount++
-                setState(TouchState.ACTIVE, "Two touches active ($continuationCount).")
-                continueHolding(myGeneration)
-            }
-
-            override fun onCancelled(gestureDescription: GestureDescription?) {
-                val elapsed = System.currentTimeMillis() - sessionStartMs
-                Log.w(TAG, "onCancelled: continuation cancelled after ${elapsed}ms, " +
-                        "$continuationCount prior continuations completed")
-                if (myGeneration != sessionGeneration) return
-                sessionActive = false
-                setState(
-                    TouchState.ERROR,
-                    "Touch hold was interrupted by the system after " +
-                            "$continuationCount continuation(s) (${elapsed}ms)."
-                )
-            }
-        }, null)
-
-        if (!dispatched) {
-            sessionActive = false
-            setState(TouchState.ERROR, "Could not continue holding the touches.")
-        }
-    }
-
     private fun releaseTest() {
         if (!sessionActive) {
             setState(TouchState.READY, "Nothing active to release.")
@@ -455,30 +412,27 @@ class MultiTouchAccessibilityService : AccessibilityService() {
         endStrokes(finalState = TouchState.RELEASED, message = "Emergency stop - released.")
     }
 
-    /** Ends both strokes together in one gesture so both contacts lift simultaneously. */
+    /**
+     * Forces the currently-held long stroke to lift by dispatching a brand-new, trivial
+     * gesture at the same coordinates. Per AccessibilityService's documented contract,
+     * dispatching a new gesture cancels whatever gesture is currently in progress - so
+     * this is the standard, supported way to end a long hold early, not a workaround.
+     * sessionGeneration is bumped first so the original hold's onCancelled callback
+     * recognizes this as an intentional release rather than a system-caused failure.
+     */
     private fun endStrokes(finalState: TouchState, message: String) {
-        sessionGeneration++ // invalidate any in-flight continueHolding callbacks
-        val s1 = strokeId1
-        val s2 = strokeId2
+        sessionGeneration++
         sessionActive = false
-        strokeId1 = null
-        strokeId2 = null
-
-        if (s1 == null || s2 == null) {
-            setState(finalState, message)
-            return
-        }
 
         val path1 = Path().apply { moveTo(point1[0], point1[1]) }
         val path2 = Path().apply { moveTo(point2[0], point2[1]) }
 
-        // Short final segment, willContinue = false -> lifts both fingers together.
-        val finalStroke1 = s1.continueStroke(path1, 0, 50L, false)
-        val finalStroke2 = s2.continueStroke(path2, 0, 50L, false)
+        val liftStroke1 = GestureDescription.StrokeDescription(path1, 0, 1L)
+        val liftStroke2 = GestureDescription.StrokeDescription(path2, 0, 1L)
 
         val gesture = GestureDescription.Builder()
-            .addStroke(finalStroke1)
-            .addStroke(finalStroke2)
+            .addStroke(liftStroke1)
+            .addStroke(liftStroke2)
             .build()
 
         val dispatched = dispatchGesture(gesture, null, null)
