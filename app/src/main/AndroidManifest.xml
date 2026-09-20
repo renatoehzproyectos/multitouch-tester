@@ -13,7 +13,7 @@
         android:allowBackup="false"
         android:icon="@android:drawable/ic_menu_manage"
         android:label="Multi-Touch Tester"
-        android:theme="@android:style/Theme.Material.Light">
+        android:theme="@style/Theme.AppCompat.Light">
 
         <!-- Entry point: explains what the tool does and walks the user through
              granting the Accessibility Service + "draw over other apps" permission -->
