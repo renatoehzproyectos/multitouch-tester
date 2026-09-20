@@ -331,13 +331,35 @@ class MultiTouchAccessibilityService : AccessibilityService() {
         sessionGeneration++
         val myGeneration = sessionGeneration
         sessionStartMs = System.currentTimeMillis()
+        sessionActive = true
 
-        // Single non-continuing stroke held for the platform's maximum gesture duration
-        // (~60s on API 26+). This is one continuous press at the API level - never
-        // sequential taps - and deliberately avoids continueStroke()/willContinue(true):
-        // on this device that continuation-chaining technique was observed to get
-        // cancelled by the system within tens of milliseconds regardless of segment
-        // length, while a single uninterrupted long stroke is the well-supported path.
+        if (!dispatchHold(myGeneration)) {
+            sessionActive = false
+            setState(
+                TouchState.ERROR,
+                "Android rejected the gesture request (accessibility service not " +
+                        "active, or the API declined to inject input). No touches were sent."
+            )
+            return
+        }
+
+        setState(TouchState.ACTIVE, "Two touches active.")
+    }
+
+    /**
+     * Dispatches one non-continuing stroke per finger, held for the platform's maximum
+     * gesture duration (~60s on API 26+). This is one continuous press at the API level -
+     * never sequential taps - and deliberately avoids continueStroke()/willContinue(true):
+     * on this device that continuation-chaining technique was observed to get cancelled
+     * by the system within tens of milliseconds regardless of segment length, while a
+     * single uninterrupted long stroke is the well-supported path.
+     *
+     * Called both by startTest() (first dispatch) and by its own onCompleted (seamless
+     * renewal once the max duration is reached while still active) - deliberately does
+     * NOT check/set sessionActive itself, so the natural-expiry renewal path isn't blocked
+     * by startTest()'s "already active" guard.
+     */
+    private fun dispatchHold(myGeneration: Int): Boolean {
         val maxDuration = GestureDescription.getMaxGestureDuration()
 
         val path1 = Path().apply { moveTo(point1[0], point1[1]) }
@@ -351,10 +373,10 @@ class MultiTouchAccessibilityService : AccessibilityService() {
             .addStroke(stroke2)
             .build()
 
-        Log.d(TAG, "startTest: dispatching single ${maxDuration}ms hold at " +
+        Log.d(TAG, "dispatchHold: dispatching ${maxDuration}ms hold at " +
                 "(${point1[0]},${point1[1]}) and (${point2[0]},${point2[1]})")
 
-        val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
+        return dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
                 val elapsed = System.currentTimeMillis() - sessionStartMs
                 Log.d(TAG, "onCompleted: hold ran its full course after ${elapsed}ms")
@@ -362,7 +384,15 @@ class MultiTouchAccessibilityService : AccessibilityService() {
                 if (!sessionActive) return
                 // Reached the platform's max duration while the user still wants it held -
                 // seamlessly re-dispatch the same hold rather than surfacing an error.
-                startTest()
+                sessionStartMs = System.currentTimeMillis()
+                if (!dispatchHold(myGeneration)) {
+                    Log.w(TAG, "onCompleted: renewal dispatch failed")
+                    sessionActive = false
+                    setState(
+                        TouchState.ERROR,
+                        "Hold reached the platform's max duration and could not be renewed."
+                    )
+                }
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
@@ -384,19 +414,6 @@ class MultiTouchAccessibilityService : AccessibilityService() {
                 )
             }
         }, null)
-
-        if (!dispatched) {
-            Log.w(TAG, "startTest: dispatchGesture() returned false immediately")
-            setState(
-                TouchState.ERROR,
-                "Android rejected the gesture request (accessibility service not " +
-                        "active, or the API declined to inject input). No touches were sent."
-            )
-            return
-        }
-
-        sessionActive = true
-        setState(TouchState.ACTIVE, "Two touches active.")
     }
 
     private fun releaseTest() {
